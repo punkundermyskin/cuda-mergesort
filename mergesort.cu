@@ -1,363 +1,282 @@
+#include <thrust/generate.h>
+#include <thrust/device_ptr.h>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <device_launch_parameters.h>
+#include <cuda_runtime.h>
+#include <ctime>
+#include <cmath>
+#include "device_launch_parameters.h"
+#include <stdio.h>
 #include <iostream>
-#include <helper_cuda.h>
-#include <sys/time.h>
+#include <algorithm>
 
-/**
- * mergesort.cu
- * a one-file c++ / cuda program for performing mergesort on the GPU
- * While the program execution is fairly slow, most of its runnning time
- *  is spent allocating memory on the GPU.
- * For a more complex program that performs many calculations,
- *  running on the GPU may provide a significant boost in performance
- */
+using namespace std;
 
-// helper for main()
-long readList(long**);
-
-// data[], size, threads, blocks, 
-void mergesort(long*, long, dim3, dim3);
-// A[]. B[], size, width, slices, nThreads
-__global__ void gpu_mergesort(long*, long*, long, long, long, dim3*, dim3*);
-__device__ void gpu_bottomUpMerge(long*, long*, long, long, long);
+class RandomNumber {
+	int nLimit;
+public:
+	RandomNumber(int lim) : nLimit(lim) {}
+	float operator() () { return (rand() % nLimit); }
+};
 
 
-// profiling
-int tm();
+//  CPU
 
-#define min(a, b) (a < b ? a : b)
+void merge(int* list, int* sorted, int start, int mid, int end)
+{
+	int ti = start, i = start, j = mid;
+	while (i < mid || j < end)
+	{
+		if (j == end) sorted[ti] = list[i++];
+		else if (i == mid) sorted[ti] = list[j++];
+		else if (list[i] < list[j]) sorted[ti] = list[i++];
+		else sorted[ti] = list[j++];
+		ti++;
+	}
 
-void printHelp(char* program) {
-
-    std::cout
-            << "usage: " << program << " [-xyzXYZv]\n"
-            << '\n'
-            << "-x, -y, -z are numbers of threads in each dimension. On my machine\n"
-            << "  the correct number is x*y*z = 32\n"
-            << '\n'
-            << "-X, -Y, -Z are numbers of blocks to use in each dimension. Each block\n"
-            << "  holds x*y*z threads, so the total number of threads is:\n"
-            << "  x*y*z*X*Y*Z\n"
-            << '\n'
-            << "-v prints out extra info\n"
-            << '\n'
-            << "? prints this message and exits\n"
-            << '\n'
-            << "example: ./mergesort -x 8 -Y 10 -v\n"
-            << '\n'
-            << "Reads in a list of integer numbers from stdin, and performs\n"
-            << "a bottom-up merge sort:\n"
-            << '\n'
-            << "Input:          8 3 1 9 1 2 7 5 9 3 6 4 2 0 2 5\n"
-            << "Threads: |    t1    |    t2    |    t3    |    t4    |\n"
-            << "         | 8 3 1 9  | 1 2 7 5  | 9 3 6 4  | 2 0 2 5  |\n"
-            << "         |  38 19   |  12 57   |  39 46   |  02 25   |\n"
-            << "         |   1398   |   1257   |   3469   |   0225   |\n"
-            << "         +----------+----------+----------+----------+\n"
-            << "         |          t1         |          t2         |\n"
-            << "         |       11235789      |       02234569      |\n"
-            << "         +---------------------+---------------------+\n"
-            << "         |                     t1                    |\n"
-            << "         |      0 1 1 2 2 2 3 3 4 5 5 6 7 8 9 9      |\n"
-            << '\n'
-            << '\n';
+	for (ti = start; ti < end; ti++)
+		list[ti] = sorted[ti];
 }
 
-bool verbose;
-int main(int argc, char** argv) {
+void mergesort_recur(int* list, int* sorted, int start, int end)
+{
+	if (end - start < 2)
+		return;
 
-    dim3 threadsPerBlock;
-    dim3 blocksPerGrid;
-
-    threadsPerBlock.x = 32;
-    threadsPerBlock.y = 1;
-    threadsPerBlock.z = 1;
-
-    blocksPerGrid.x = 8;
-    blocksPerGrid.y = 1;
-    blocksPerGrid.z = 1;
-
-    //
-    // Parse argv
-    //
-    tm();
-    for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '-' && argv[i][1] && !argv[i][2]) {
-            char arg = argv[i][1];
-            unsigned int* toSet = 0;
-            switch(arg) {
-                case 'x':
-                    toSet = &threadsPerBlock.x;
-                    break;
-                case 'y':
-                    toSet = &threadsPerBlock.y;
-                    break;
-                case 'z':
-                    toSet = &threadsPerBlock.z;
-                    break;
-                case 'X':
-                    toSet = &blocksPerGrid.x;
-                    break;
-                case 'Y':
-                    toSet = &blocksPerGrid.y;
-                    break;
-                case 'Z':
-                    toSet = &blocksPerGrid.z;
-                    break;
-                case 'v':
-                    verbose = true;
-                    break;
-                default:
-                    std::cout << "unknown argument: " << arg << '\n';
-                    printHelp(argv[0]);
-                    return -1;
-            }
-
-            if (toSet) {
-                i++;
-                *toSet = (unsigned int) strtol(argv[i], 0, 10);
-            }
-        }
-        else {
-            if (argv[i][0] == '?' && !argv[i][1])
-                std::cout << "help:\n";
-            else
-                std::cout << "invalid argument: " << argv[i] << '\n';
-            printHelp(argv[0]);
-            return -1;
-        }
-    }
-
-    if (verbose) {
-        std::cout << "parse argv " << tm() << " microseconds\n";
-        std::cout << "\nthreadsPerBlock:"
-                  << "\n  x: " << threadsPerBlock.x
-                  << "\n  y: " << threadsPerBlock.y
-                  << "\n  z: " << threadsPerBlock.z
-                  << "\n\nblocksPerGrid:"
-                  << "\n  x:" << blocksPerGrid.x
-                  << "\n  y:" << blocksPerGrid.y
-                  << "\n  z:" << blocksPerGrid.z
-                  << "\n\n total threads: " 
-                  << threadsPerBlock.x * threadsPerBlock.y * threadsPerBlock.z *
-                     blocksPerGrid.x * blocksPerGrid.y * blocksPerGrid.z
-                  << "\n\n";
-    }
-
-    //
-    // Read numbers from stdin
-    //
-    long* data;
-    long size = readList(&data);
-    if (!size) return -1;
-
-    if (verbose)
-        std::cout << "sorting " << size << " numbers\n\n";
-
-    // merge-sort the data
-    mergesort(data, size, threadsPerBlock, blocksPerGrid);
-
-    tm();
-
-    //
-    // Print out the list
-    //
-    for (int i = 0; i < size; i++) {
-        std::cout << data[i] << '\n';
-    } 
-
-    if (verbose) {
-        std::cout << "print list to stdout: " << tm() << " microseconds\n";
-    }
+	mergesort_recur(list, sorted, start, start + (end - start) / 2);
+	mergesort_recur(list, sorted, start + (end - start) / 2, end);
+	merge(list, sorted, start, start + (end - start) / 2, end);
 }
 
-void mergesort(long* data, long size, dim3 threadsPerBlock, dim3 blocksPerGrid) {
-
-    //
-    // Allocate two arrays on the GPU
-    // we switch back and forth between them during the sort
-    //
-    long* D_data;
-    long* D_swp;
-    dim3* D_threads;
-    dim3* D_blocks;
-    
-    // Actually allocate the two arrays
-    tm();
-    checkCudaErrors(cudaMalloc((void**) &D_data, size * sizeof(long)));
-    checkCudaErrors(cudaMalloc((void**) &D_swp, size * sizeof(long)));
-    if (verbose)
-        std::cout << "cudaMalloc device lists: " << tm() << " microseconds\n";
-
-    // Copy from our input list into the first array
-    checkCudaErrors(cudaMemcpy(D_data, data, size * sizeof(long), cudaMemcpyHostToDevice));
-    if (verbose) 
-        std::cout << "cudaMemcpy list to device: " << tm() << " microseconds\n";
- 
-    //
-    // Copy the thread / block info to the GPU as well
-    //
-    checkCudaErrors(cudaMalloc((void**) &D_threads, sizeof(dim3)));
-    checkCudaErrors(cudaMalloc((void**) &D_blocks, sizeof(dim3)));
-
-    if (verbose)
-        std::cout << "cudaMalloc device thread data: " << tm() << " microseconds\n";
-    checkCudaErrors(cudaMemcpy(D_threads, &threadsPerBlock, sizeof(dim3), cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(D_blocks, &blocksPerGrid, sizeof(dim3), cudaMemcpyHostToDevice));
-
-    if (verbose)
-        std::cout << "cudaMemcpy thread data to device: " << tm() << " microseconds\n";
-
-    long* A = D_data;
-    long* B = D_swp;
-
-    long nThreads = threadsPerBlock.x * threadsPerBlock.y * threadsPerBlock.z *
-                    blocksPerGrid.x * blocksPerGrid.y * blocksPerGrid.z;
-
-    //
-    // Slice up the list and give pieces of it to each thread, letting the pieces grow
-    // bigger and bigger until the whole list is sorted
-    //
-    for (int width = 2; width < (size << 1); width <<= 1) {
-        long slices = size / ((nThreads) * width) + 1;
-
-        if (verbose) {
-            std::cout << "mergeSort - width: " << width 
-                      << ", slices: " << slices 
-                      << ", nThreads: " << nThreads << '\n';
-            tm();
-        }
-
-        // Actually call the kernel
-        gpu_mergesort<<<blocksPerGrid, threadsPerBlock>>>(A, B, size, width, slices, D_threads, D_blocks);
-
-        if (verbose)
-            std::cout << "call mergesort kernel: " << tm() << " microseconds\n";
-
-        // Switch the input / output arrays instead of copying them around
-        A = A == D_data ? D_swp : D_data;
-        B = B == D_data ? D_swp : D_data;
-    }
-
-    //
-    // Get the list back from the GPU
-    //
-    tm();
-    checkCudaErrors(cudaMemcpy(data, A, size * sizeof(long), cudaMemcpyDeviceToHost));
-    if (verbose)
-        std::cout << "cudaMemcpy list back to host: " << tm() << " microseconds\n";
-    
-    
-    // Free the GPU memory
-    checkCudaErrors(cudaFree(A));
-    checkCudaErrors(cudaFree(B));
-    if (verbose)
-        std::cout << "cudaFree: " << tm() << " microseconds\n";
-}
-
-// GPU helper function
-// calculate the id of the current thread
-__device__ unsigned int getIdx(dim3* threads, dim3* blocks) {
-    int x;
-    return threadIdx.x +
-           threadIdx.y * (x  = threads->x) +
-           threadIdx.z * (x *= threads->y) +
-           blockIdx.x  * (x *= threads->z) +
-           blockIdx.y  * (x *= blocks->z) +
-           blockIdx.z  * (x *= blocks->y);
-}
-
-//
-// Perform a full mergesort on our section of the data.
-//
-__global__ void gpu_mergesort(long* source, long* dest, long size, long width, long slices, dim3* threads, dim3* blocks) {
-    unsigned int idx = getIdx(threads, blocks);
-    long start = width*idx*slices, 
-         middle, 
-         end;
-
-    for (long slice = 0; slice < slices; slice++) {
-        if (start >= size)
-            break;
-
-        middle = min(start + (width >> 1), size);
-        end = min(start + width, size);
-        gpu_bottomUpMerge(source, dest, start, middle, end);
-        start += width;
-    }
-}
-
-//
-// Finally, sort something
-// gets called by gpu_mergesort() for each slice
-//
-__device__ void gpu_bottomUpMerge(long* source, long* dest, long start, long middle, long end) {
-    long i = start;
-    long j = middle;
-    for (long k = start; k < end; k++) {
-        if (i < middle && (j >= end || source[i] < source[j])) {
-            dest[k] = source[i];
-            i++;
-        } else {
-            dest[k] = source[j];
-            j++;
-        }
-    }
-}
-
-// read data into a minimal linked list
-typedef struct {
-    int v;
-    void* next;
-} LinkNode;
-
-// helper function for reading numbers from stdin
-// it's 'optimized' not to check validity of the characters it reads in..
-long readList(long** list) {
-    tm();
-    long v, size = 0;
-    LinkNode* node = 0;
-    LinkNode* first = 0;
-    while (std::cin >> v) {
-        LinkNode* next = new LinkNode();
-        next->v = v;
-        if (node)
-            node->next = next;
-        else 
-            first = next;
-        node = next;
-        size++;
-    }
-
-
-    if (size) {
-        *list = new long[size]; 
-        LinkNode* node = first;
-        long i = 0;
-        while (node) {
-            (*list)[i++] = node->v;
-            node = (LinkNode*) node->next;
-        }
-
-    }
-
-    if (verbose)
-        std::cout << "read stdin: " << tm() << " microseconds\n";
-
-    return size;
+int mergesort_cpu(int* list, int* sorted, int n)
+{
+	mergesort_recur(list, sorted, 0, n);
+	return 1;
 }
 
 
-// 
-// Get the time (in microseconds) since the last call to tm();
-// the first value returned by this must not be trusted
-//
-timeval tStart;
-int tm() {
-    timeval tEnd;
-    gettimeofday(&tEnd, 0);
-    int t = (tEnd.tv_sec - tStart.tv_sec) * 1000000 + tEnd.tv_usec - tStart.tv_usec;
-    tStart = tEnd;
-    return t;
+//  GPU Implementation 
+
+__device__ void merge_gpu(int* list, int* sorted, int start, int mid, int end)
+{
+	int k = start, i = start, j = mid;
+	while (i < mid || j < end)
+	{
+		if (j == end)
+		{
+			sorted[k] = list[i++];
+		}
+		else if (i == mid) sorted[k] = list[j++];
+		else if (list[i] < list[j]) sorted[k] = list[i++];
+		else sorted[k] = list[j++];
+		k++;
+	}
+}
+
+__global__ void mergesort_gpu(int* list, int* sorted, int n, int chunk)
+{
+
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	int start = tid * chunk;
+	if (start >= n) return;
+	int mid, end;
+
+	mid = min(start + chunk / 2, n);
+	end = min(start + chunk, n);
+	merge_gpu(list, sorted, start, mid, end);
+}
+
+// Sequential Merge Sort for GPU when Number of Threads Required gets below 1 Warp Size
+void mergesort_gpu_seq(int* list, int* sorted, int n, int chunk)
+{
+	int chunk_id;
+	for (chunk_id = 0; chunk_id * chunk <= n; chunk_id++) {
+		int start = chunk_id * chunk, end, mid;
+		if (start >= n) return;
+		mid = min(start + chunk / 2, n);
+		end = min(start + chunk, n);
+		merge(list, sorted, start, mid, end);
+	}
 }
 
 
+int mergesort(int* list, int* sorted, int n)
+{
+
+	int* list_d;
+	int* sorted_d;
+	int dummy;
+	bool flag = false;
+	bool sequential = false;
+
+	int size = n * sizeof(int);
+
+	cudaMalloc((void**)&list_d, size);
+	cudaMalloc((void**)&sorted_d, size);
+
+	cudaMemcpy(list_d, list, size, cudaMemcpyHostToDevice);
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess)
+	{
+		printf("Error_2: %s\n", cudaGetErrorString(err));
+		return -1;
+	}
+
+	cudaDeviceProp prop;
+	cudaGetDeviceProperties(&prop, 0);
+
+	// compute capability
+	const int max_active_blocks_per_sm = 16;
+	const int max_active_warps_per_sm = 64;
+
+	int warp_size = prop.warpSize;
+	int max_grid_size = prop.maxGridSize[0];
+	int max_threads_per_block = prop.maxThreadsPerBlock;
+    std::cout << "max_threads_per_block" << max_threads_per_block << std::endl;
+	int max_procs_count = prop.multiProcessorCount;
+
+	int max_active_blocks = max_active_blocks_per_sm * max_procs_count;
+	int max_active_warps = max_active_warps_per_sm * max_procs_count;
+
+	int chunk_size;
+	for (chunk_size = 2; chunk_size < 2 * n; chunk_size *= 2)
+	{
+		int blocks_required = 0, threads_per_block = 0;
+		int threads_required = (n % chunk_size == 0) ? n / chunk_size : n / chunk_size + 1;
+        
+		if (threads_required <= warp_size * 3 && !sequential)
+		{
+//             std::cout << "COPY DATA TO HOST   ";
+//             std::cout << chunk_size << "- if (threads_required[" << threads_required << "]<=warp_size*3[" << warp_size * 3 << "]&& !sequential[" << !sequential << "])" << std::endl;
+			sequential = true;
+			if (flag)
+			{
+				cudaMemcpy(list, sorted_d, size, cudaMemcpyDeviceToHost);
+			}
+			else
+			{
+				cudaMemcpy(list, list_d, size, cudaMemcpyDeviceToHost);
+			}
+			err = cudaGetLastError();
+			if (err != cudaSuccess)
+			{
+				printf("ERROR_4: %s\n", cudaGetErrorString(err));
+				return -1;
+			}
+			cudaFree(list_d);
+			cudaFree(sorted_d);
+		}
+		else if (threads_required < max_threads_per_block)
+		{
+			threads_per_block = warp_size * 4;
+			dummy = threads_required / threads_per_block;
+			blocks_required = (threads_required % threads_per_block == 0) ? dummy : dummy + 1;
+		}
+		else if (threads_required < max_active_blocks * warp_size * 4)
+		{
+			threads_per_block = max_threads_per_block / 2;
+			dummy = threads_required / threads_per_block;
+			blocks_required = (threads_required % threads_per_block == 0) ? dummy : dummy + 1;
+		}
+		else
+		{
+			dummy = threads_required / max_active_blocks;
+			int estimated_threads_per_block = (threads_required % max_active_blocks == 0) ? dummy : dummy + 1;
+			if (estimated_threads_per_block > max_threads_per_block)
+			{
+				threads_per_block = max_threads_per_block;
+				dummy = threads_required / max_threads_per_block;
+				blocks_required = (threads_required % max_threads_per_block == 0) ? dummy : dummy + 1;
+			}
+			else
+			{
+				threads_per_block = estimated_threads_per_block;
+				blocks_required = max_active_blocks;
+			}
+		}
+
+		if (blocks_required >= max_grid_size)
+		{
+			printf("ERROR_2: Too many Blocks Required\n");
+			return -1;
+		}
+
+		if (sequential)
+		{
+//             std::cout << "cpu merge" << std::endl;
+			mergesort_gpu_seq(list, sorted, n, chunk_size);
+		}
+		else
+		{
+//             std::cout << "GPU RUN" << std::endl;
+			if (flag) mergesort_gpu << <blocks_required, threads_per_block >> > (sorted_d, list_d, n, chunk_size);
+			else mergesort_gpu << <blocks_required, threads_per_block >> > (list_d, sorted_d, n, chunk_size);
+			cudaDeviceSynchronize();
+			err = cudaGetLastError();
+			if (err != cudaSuccess) {
+				printf("ERROR_3: %s\n", cudaGetErrorString(err));
+				return -1;
+			}
+			flag = !flag;
+		}
+//         std::cout << "chunk_size: " << chunk_size << " blocks_required: " << blocks_required << " threads_per_block: " << threads_per_block << " threads_required: " << threads_required << "    " << flag << std::endl;
+	}
+	return 0;
+}
+
+int main(int argc, char const *argv[]) {
+
+	// struct timespec start, stop;
+	clock_t start, stop, result;
+// 	int n_list[] = { 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 100000000};
+	int n_list[] = { 100000000, 1000000000, 100000000 };
+    int i, j;
+	for (j = 0; j < 3; j++) {
+		printf("Elements count: %d\n", n_list[j]);
+		int *sorted = (int *)malloc(n_list[j] * sizeof(int));
+		int *list = (int *)malloc(n_list[j] * sizeof(int));
+		int *sorted_s = (int *)malloc(n_list[j] * sizeof(int));
+		int *list_s = (int *)malloc(n_list[j] * sizeof(int));
+		for (i = 0; i < n_list[j]; i++) {
+			list[i] = rand() % 10000;
+			list_s[i] = list[i];
+		}
+		start = clock();
+
+		mergesort(list, sorted, n_list[j]);
+
+		stop = clock();
+		cout << "GPU time: " << (long double)(stop - start) / (CLOCKS_PER_SEC / 1000) << " ms" << endl;
+
+		start = clock();
+
+		mergesort_cpu(list_s, sorted_s, n_list[j]);
+
+		stop = clock();
+
+		cout << "CPU time: " << (long double)(stop - start) / (CLOCKS_PER_SEC / 1000) << " ms" << endl;
+
+		for (i = 1; i < n_list[j]; i++) {
+			if (sorted[i - 1] > sorted[i]) {
+				printf("false sort _1\n");
+				return -1;
+			}
+		}
+		for (i = 0; i < n_list[j]; i++) {
+			if (sorted_s[i] != sorted[i]) {
+				printf("false sort _2\n");
+				printf("P:%d, S:%d, Index:%d\n", sorted[i], sorted_s[i], i);
+				return -1;
+			}
+		}
+		printf("corrected sort\n");
+
+		free(sorted);
+		free(list);
+		free(sorted_s);
+		free(list_s);
+		printf("---------------------------------------------------\n");
+	}
+	return 0;
+}
